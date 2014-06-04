@@ -1,8 +1,18 @@
 // Valgrind Memcheck error detection demo
-// To compile:	gcc valgrind-example.c -g -o valgrind-example
-// To run:	valgrind ./valgrind-example
+// To compile with libc malloc():	gcc valgrind-example.c -g -o valgrind-example
+// To compile with dlmalloc:		gcc valgrind-example.c -g -DDLMALLOC -o valgrind-example
+// To run:				valgrind ./valgrind-example
 
-#include <stdlib.h>
+#ifdef DLMALLOC
+	#define MSPACES 1
+	#define ONLY_MSPACES 1
+	#define USE_LOCKS 0
+	#define HAVE_VALGRIND_VALGRIND_H
+	#define HAVE_VALGRIND_MEMCHECK_H
+	#include "malloc.c"
+#else
+	#include <stdlib.h>
+#endif
 
 int main(int argc, char *argv[])
 {
