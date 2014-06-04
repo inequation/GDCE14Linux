@@ -1,0 +1,3 @@
+[submodule "opengl/ac130"]
+	path = opengl/ac130
+	url = https://github.com/inequation/ac130.git
