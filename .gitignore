@@ -1,0 +1,6 @@
+# Don't keep track of object files
+**/*.cpp.o
+# Don't version binaries
+sighandler/sighandler
+valgrind/valgrind-example
+priority/niceness
