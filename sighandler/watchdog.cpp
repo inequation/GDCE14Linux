@@ -15,7 +15,8 @@ int g_watchdog_pipe[2];
 static pid_t g_game;
 
 // watchdog exit request flag
-static volatile bool g_watchdog_exit = false;
+#if WATCHDOG_IS_PARENT
+	static volatile bool g_watchdog_exit = false;
 
 void watchdog_signal_handler(int signal, siginfo_t *info, void *context)
 {
@@ -32,12 +33,16 @@ void watchdog_signal_handler(int signal, siginfo_t *info, void *context)
 	// quit if our chlid process has exited
 	g_watchdog_exit = true;
 }
+#else	// WATCHDOG_IS_PARENT
+	// in unix, if a parent process dies, its children are re-parented upward in
+	// the process tree, so we can detect orphaning as parent PID change
+	#define g_watchdog_exit	(g_game == getppid())
+#endif
 
 void watchdog_print(struct watchdog_data *wd, const char *stack)
 {
-	printf("[Watchdog] Game received signal: %s (reason: 0x%x) at address %p. "
-		"Stack trace (%d frames):\n%s\n", strsignal(wd->signal), wd->code,
-		wd->addr, wd->depth, stack);
+	psiginfo(&wd->siginfo, "[Watchdog] Game received signal");
+	printf("[Watchdog] Stack trace (%d frames):\n%s\n", wd->depth, stack);
 }
 
 int watchdog(pid_t game)
@@ -50,6 +55,7 @@ int watchdog(pid_t game)
 	
 	int retval = 0;
 	
+#if WATCHDOG_IS_PARENT
 	// set up the watchdog signal handler; we only actually care about SIGCHLD
 	struct sigaction action;
 	memset(&action, 0, sizeof(action));
@@ -57,10 +63,13 @@ int watchdog(pid_t game)
 	// filter out suspend/resume signals, don't turn the child into a zombie and
 	// give us extended signal info, please
 	action.sa_flags = SA_NOCLDSTOP | SA_NOCLDWAIT | SA_SIGINFO;
-	sigaction(SIGCHLD, &action, NULL);
-	
+	retval = sigaction(SIGCHLD, &action, NULL);
 	if (retval != 0)
+	{
+		printf("[Watchdog] Failed to set signal handler!\n");
 		return retval;
+	}
+#endif
 	
 	printf("[Watchdog] Running!\n");
 	
@@ -68,7 +77,7 @@ int watchdog(pid_t game)
 	struct watchdog_data wd;
 	char stack[1024], *s;
 	int left;
-	while (!g_watchdog_exit)
+	do
 	{
 		memset(&wd, 0, sizeof(wd));
 		stack[0] = 0;
@@ -101,7 +110,7 @@ int watchdog(pid_t game)
 				}
 				else
 				{
-					printf("[Watchdog] Clean EOF received, dying gracefully\n");
+					printf("[Watchdog] Pipe EOF\n");
 					goto die;
 				}
 			}
@@ -134,7 +143,6 @@ int watchdog(pid_t game)
 				{
 					printf("[Watchdog] EOF received, truncating stack trace\n");
 					left = 0;
-					g_watchdog_exit = true;
 				}
 			}
 			
@@ -152,7 +160,7 @@ int watchdog(pid_t game)
 		watchdog_print(&wd, stack);
 		
 		// phew! info about one signal emitted, wait for another one
-	}
+	} while (true);
 	
 die:
 	

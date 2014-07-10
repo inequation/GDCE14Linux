@@ -1,17 +1,16 @@
 #include <pthread.h>
 #include <signal.h>
-#include <unistd.h>		// for write() and usleep()
-#include <execinfo.h>	// for backtrace() and backtrace_symbols_fd()
-#include <stdio.h>		// for stdin/stdout/fflush/printf etc.
-#include <stdlib.h>		// for abort()
-#include <string.h>		// for memset()
-#include <errno.h>		// for EBUSY
-#include <sys/wait.h>	// for waitpid()
+#include <unistd.h>			// for write() and usleep()
+#include <execinfo.h>		// for backtrace() and backtrace_symbols_fd()
+#include <stdio.h>			// for stdin/stdout/fflush/printf etc.
+#include <stdlib.h>			// for abort()
+#include <string.h>			// for memset()
+#include <errno.h>			// for EBUSY
+#include <sys/wait.h>		// for waitpid()
+#include <sys/resource.h>	// for struct rlimit
+#include <algorithm>		// for std::min
 
 #include "watchdog.h"
-
-// spinlock for blocking handler access against concurrent faulting threads
-static pthread_spinlock_t g_handler_lock;
 
 // list of signals we care about
 static const int g_interest[] =
@@ -32,27 +31,37 @@ static const size_t g_num_interest = sizeof(g_interest) / sizeof(g_interest[0]);
 // list of signals we ignore
 static const int g_ignore[] =
 {
+	// NOTE: in the real world, these two might be worth catching – could mean
+	// something happened to a child process, e.g. the watchdog
 	SIGCHLD,
-	SIGPIPE	// NOTE: in the real world, this may be worth catching – could mean
-			// something happened to the watchdog
+	SIGPIPE
 };
 static const size_t g_num_ignore = sizeof(g_ignore) / sizeof(g_ignore[0]);
+
+// spinlock for blocking handler access against concurrent faulting threads
+static pthread_spinlock_t g_handler_lock;
 
 // we keep default signal actions here for possible chaining
 static struct sigaction g_default_actions[g_num_interest];
 
-void game_signal_handler(int signal, siginfo_t *info, void *context)
+static pid_t g_watchdog_pid = (pid_t)-1;
+
+
+// ============================================================================
+
+
+void game_signal_handler(int signum, siginfo_t *info, void *context)
 {
 	// some of the signals are supposed to dump core
-	bool coredump	= signal == SIGSEGV
-				   || signal == SIGQUIT
-				   || signal == SIGFPE;
+	bool coredump	= signum == SIGSEGV
+				   || signum == SIGQUIT
+				   || signum == SIGFPE;
 	// and some are survivable while others aren't
 	// NOTE: strictly speaking, some signals are not faults but graceful exit
 	// requests, e.g. SIGTERM, and SIGCHLD informs about child execution state
 	// change
-	bool fatal		= signal != SIGCHLD && signal != SIGTERM && signal != SIGQUIT;
-	bool clean		= signal == SIGTERM;
+	bool fatal		= signum != SIGCHLD && signum != SIGTERM && signum != SIGQUIT;
+	bool clean		= signum == SIGTERM;
 	
 	// spin to block concurrent faulting threads
 	// NOTE: if the contenting thread is of higher priority, we'll deadlock -
@@ -66,9 +75,7 @@ void game_signal_handler(int signal, siginfo_t *info, void *context)
 	// dump the information down the pipe
 	// NOTE: printf() and friends are *NOT* safe! that's why the custom protocol
 	struct watchdog_data wd;
-	wd.signal	= signal;
-	wd.code		= info->si_code;
-	wd.addr		= info->si_addr;
+	wd.siginfo	= *info;
 	// actual stack walking happens here
 	wd.depth	= backtrace(stack, sizeof(stack) / sizeof(stack[0]));
 	write(g_watchdog_pipe[1], &wd, sizeof(wd));
@@ -81,19 +88,22 @@ void game_signal_handler(int signal, siginfo_t *info, void *context)
 	
 	if (coredump)
 	{
+		// NOTE: printf is unsafe! just for illustration purposes!
+		printf("[Sighandler] Want core dump, raising\n");
+		
 		// restore default handler
 		size_t index;
 		for (size_t i = 0; i < g_num_interest; ++i)
 		{
-			if (g_interest[i] == signal)
+			if (g_interest[i] == signum)
 			{
 				index = i;
 				break;
 			}
 		}
-		sigaction(signal, &g_default_actions[index], NULL);
+		sigaction(signum, &g_default_actions[index], NULL);
 		// re-raise so that the default handler dumps core
-		raise(signal);
+		raise(signum);
 	}
 	else if (clean)
 	{
@@ -102,6 +112,9 @@ void game_signal_handler(int signal, siginfo_t *info, void *context)
 	}
 	else if (fatal)
 	{
+		// NOTE: printf is unsafe! just for illustration purposes!
+		printf("[Sighandler] Signal is fatal, aborting\n");
+		
 		// make sure all other output is flushed
 		fflush(stdout);
 		fflush(stderr);
@@ -110,16 +123,7 @@ void game_signal_handler(int signal, siginfo_t *info, void *context)
 	}
 }
 
-void *segfault(void *arg = NULL)
-{
-	// try to sleep some so that different threads get a chance to compete for
-	// the signal handler
-	usleep(rand() % 100);
-	*(int *)0xabad1dea = 0;
-	return NULL;
-}
-
-int main(int argc, char *argv[])
+int sighandler_install(size_t max_core_size)
 {
 	int retval = 0;
 	
@@ -130,19 +134,45 @@ int main(int argc, char *argv[])
 	
 	// fork ASAP, before our process image grows big!
 	// NOTE:	the debugger (gdb) will by default follow the parent upon a
-	//			fork, which will be the watchdog; if you want to debug the game
-	//			process instead, you will need to either change the fork
-	//			following mode in gdb:
+	//			fork; if you want to debug the child process instead, you will
+	//			need to either change the fork following mode in gdb:
 	//
 	//			(gdb) set follow-fork-mode child
 	//
-	//			(this command can be put in your ~/.gdbinit file, for instance)
 	//			or simply run another gdb instance and attach to the child
 	//			process (the variable pid below will contain its PID)
-	pid_t pid = fork();
-	if (pid != 0)
-		// we are the watchdog
-		return watchdog(pid);
+	g_watchdog_pid = fork();
+#if WATCHDOG_IS_PARENT
+	if (g_watchdog_pid != 0)
+		// we are the watchdog as parent
+		exit(watchdog(g_watchdog_pid));
+#else
+	if (g_watchdog_pid == 0)
+		// we are the watchdog as child
+		exit(watchdog(getppid()));
+#endif
+	
+	// enable core dumping
+	struct rlimit rlim;
+	retval = getrlimit(RLIMIT_CORE, &rlim);
+	if (retval == 0)
+	{
+		if (rlim.rlim_max != RLIM_INFINITY)
+			rlim.rlim_cur = std::min(max_core_size, rlim.rlim_max);
+		else if (max_core_size == (size_t)-1)
+			rlim.rlim_cur = RLIM_INFINITY;
+		else
+			rlim.rlim_cur = max_core_size;
+		retval = getrlimit(RLIMIT_CORE, &rlim);
+		if (retval == 0)
+			printf("[Sighandler] Core dump size set to %d\n", rlim.rlim_cur);
+		else
+			printf("[Sighandler] Cannot set core dump size, core dumping "
+				"probably won't work. Error: %s\n", strerror(errno));
+	}
+	else
+		printf("[Sighandler] Cannot get maximum core dump size, core dumping "
+			"probably won't work. Error: %s\n", strerror(errno));
 	
 	// initialize the signal handler spinlock
 	pthread_spin_init(&g_handler_lock, PTHREAD_PROCESS_PRIVATE);
@@ -160,7 +190,7 @@ int main(int argc, char *argv[])
 		retval = sigaction(g_interest[i], &action, &g_default_actions[i]);
 		if (retval != 0)
 		{
-			fprintf(stderr, "[Game] Failed to set handler for signal %s: %s\n",
+			fprintf(stderr, "[Sighandler] Failed to set handler for signal %s: %s\n",
 				strsignal(g_interest[i]), strerror(errno));
 		}
 	}
@@ -173,34 +203,20 @@ int main(int argc, char *argv[])
 		retval = sigaction(g_ignore[i], &action, NULL);
 		if (retval != 0)
 		{
-			fprintf(stderr, "[Game] Failed to ignore signal %s: %s\n",
+			fprintf(stderr, "[Sighandler] Failed to ignore signal %s: %s\n",
 				strsignal(g_ignore[i]), strerror(errno));
 		}
 	}
 	
-	printf("[Game] Init done, attempting segfault\n");
-	
-	// spawn some segfaulting threads to try competing for the handler
-	pthread_t pool[4];
-	for (size_t i = 0; i < sizeof(pool) / sizeof(pool[0]); ++i)
-	{
-		retval = pthread_create(&pool[i], NULL, segfault, NULL);
-		if (retval != 0)
-			return retval;
-	}
-	
-	// also segfault deliberately here!
-	segfault();
-	
-	// we never reach here, but this is what needs to be done for proper cleanup
-	// closing the pipe sends a SIGPIPE to the watchdog, which should cause it
-	// to die gracefully
+	return retval;
+}
+
+void sighandler_cleanup()
+{
 	while (pthread_spin_destroy(&g_handler_lock) == EBUSY)
 		usleep(10 * 1000);
 	close(g_watchdog_pipe[0]);
 	close(g_watchdog_pipe[1]);
-	// wait for the watchdog to die
-	waitpid(pid, NULL, 0);
-	
-	return retval;
+	// no need to wait for the watchdog – if it's the parent, it will react to
+	// SIGCHLD; if it's the child, it will die once orphaned
 }

@@ -1,5 +1,7 @@
+SOURCES+=game.cpp
 SOURCES+=sighandler.cpp
 SOURCES+=watchdog.cpp
+HEADERS+=sighandler.h
 HEADERS+=watchdog.h
 OUTPUT=sighandler
 
