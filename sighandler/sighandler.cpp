@@ -163,9 +163,9 @@ int sighandler_install(size_t max_core_size)
 			rlim.rlim_cur = RLIM_INFINITY;
 		else
 			rlim.rlim_cur = max_core_size;
-		retval = getrlimit(RLIMIT_CORE, &rlim);
+		retval = setrlimit(RLIMIT_CORE, &rlim);
 		if (retval == 0)
-			printf("[Sighandler] Core dump size set to %d\n", rlim.rlim_cur);
+			printf("[Sighandler] Core dump size set to %lu\n", rlim.rlim_cur);
 		else
 			printf("[Sighandler] Cannot set core dump size, core dumping "
 				"probably won't work. Error: %s\n", strerror(errno));
